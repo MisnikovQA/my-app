@@ -1,4 +1,4 @@
-// app/lib/system.ts
+// src/app/lib/system.ts
 import os from "os";
 import { exec as execCb } from "child_process";
 import { promisify } from "util";
@@ -30,7 +30,6 @@ export type SystemDetails = {
     usedGB: number;
     freeGB: number;
   } | null;
-
   activeUsers: Array<{
     user: string;
     tty: string;
@@ -44,8 +43,32 @@ export type SystemDetails = {
   }>;
 };
 
+/* ----------------------- small type helpers ----------------------- */
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+function isNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/** One temperature sensor entry in `sensors -j` */
+type SensorEntry = {
+  temp1_label?: string;
+  label?: string;
+  name?: string;
+  temp_label?: string;
+  temp1_input?: number;
+  input?: number;
+  value?: number;
+};
+/** sensors -j JSON is nested: chip -> tempX -> SensorEntry */
+type SensorsJson = Record<string, Record<string, SensorEntry>>;
+
+/* ---------------------------- basics ------------------------------ */
+
 function bytesToGB(bytes: number): number {
-  return parseFloat((bytes / (1024 ** 3)).toFixed(2));
+  return parseFloat((bytes / 1024 ** 3).toFixed(2));
 }
 
 function getCpuUsage(): string[] {
@@ -66,21 +89,37 @@ async function commandExists(cmd: string): Promise<boolean> {
   }
 }
 
+/* --------------------- temperature detection ---------------------- */
+
 async function getCpuTempViaSensors(): Promise<number | null> {
   if (!(await commandExists("sensors"))) return null;
   try {
     const { stdout } = await execAsync("sensors -j");
-    const data = JSON.parse(stdout);
+    const parsed: unknown = JSON.parse(stdout);
+
+    if (!isRecord(parsed)) return null;
+    const data = parsed as SensorsJson;
+
     let best: number | null = null;
-    for (const chip of Object.values<any>(data)) {
-      for (const sensor of Object.values<any>(chip)) {
-        if (!sensor || typeof sensor !== "object") continue;
-        const label = (sensor.temp1_label || sensor.label || "").toLowerCase();
-        const val = sensor.temp1_input ?? sensor.input ?? sensor.value;
-        if (typeof val === "number") {
-          if (label.includes("package id 0")) return val;
-          if (/(package|cpu|tdie|tctl|core)/i.test(label)) best = val;
-          else if (best == null) best = val;
+
+    for (const chip of Object.values(data)) {
+      if (!isRecord(chip)) continue;
+
+      const chipObj = chip as Record<string, unknown>;
+      for (const [key, val] of Object.entries(chipObj)) {
+        if (!/^temp\d+/.test(key)) continue;
+        if (!isRecord(val)) continue;
+
+        const entry = val as SensorEntry;
+        const labelRaw =
+          entry.temp1_label ?? entry.label ?? entry.name ?? entry.temp_label ?? "";
+        const label = String(labelRaw).toLowerCase();
+        const value = entry.temp1_input ?? entry.input ?? entry.value;
+
+        if (isNumber(value)) {
+          if (label.includes("package id 0")) return value; // prefer CPU package
+          if (/(package|cpu|tdie|tctl|core)/i.test(label)) best = value;
+          else if (best == null) best = value;
         }
       }
     }
@@ -95,17 +134,28 @@ async function getCpuTempViaHwmon(): Promise<number | null> {
   try {
     const hwmons = await fs.readdir(root);
     let candidate: number | null = null;
+
     for (const dir of hwmons) {
       const dirPath = path.join(root, dir);
-      const files = await fs.readdir(dirPath);
+      let files: string[] = [];
+      try {
+        files = await fs.readdir(dirPath);
+      } catch {
+        continue;
+      }
+
       for (const f of files.filter((x) => /^temp\d+_input$/.test(x))) {
         const base = f.replace("_input", "");
         const inputPath = path.join(dirPath, f);
         const labelPath = path.join(dirPath, `${base}_label`);
+
         let label = "";
         try {
           label = (await fs.readFile(labelPath, "utf8")).trim().toLowerCase();
-        } catch {}
+        } catch {
+          // ignore
+        }
+
         try {
           const valStr = await fs.readFile(inputPath, "utf8");
           const mdeg = parseInt(valStr.trim(), 10);
@@ -115,7 +165,9 @@ async function getCpuTempViaHwmon(): Promise<number | null> {
             if (/(package|tctl|tdie|cpu)/i.test(label)) return c;
             if (candidate == null) candidate = c;
           }
-        } catch {}
+        } catch {
+          // ignore this sensor
+        }
       }
     }
     return candidate;
@@ -130,12 +182,16 @@ async function getCpuTempViaThermalZones(): Promise<number | null> {
     const zones = (await fs.readdir(tzRoot)).filter((d) => d.startsWith("thermal_zone"));
     let preferred: number | null = null;
     let any: number | null = null;
+
     for (const z of zones) {
       const zPath = path.join(tzRoot, z);
       let type = "";
       try {
         type = (await fs.readFile(path.join(zPath, "type"), "utf8")).trim().toLowerCase();
-      } catch {}
+      } catch {
+        // ignore
+      }
+
       try {
         const val = parseInt(await fs.readFile(path.join(zPath, "temp"), "utf8"), 10);
         if (!Number.isNaN(val)) {
@@ -143,7 +199,9 @@ async function getCpuTempViaThermalZones(): Promise<number | null> {
           if (/pkg|cpu|soc|acpi/.test(type)) preferred = c;
           else if (any == null) any = c;
         }
-      } catch {}
+      } catch {
+        // ignore
+      }
     }
     return preferred ?? any;
   } catch {
@@ -160,6 +218,8 @@ async function getCpuTemp(): Promise<number> {
   if (viaTz != null) return viaTz;
   return NaN;
 }
+
+/* ----------------------- memory & disk utils ---------------------- */
 
 async function readMeminfo(): Promise<Record<string, number>> {
   const txt = await fs.readFile("/proc/meminfo", "utf8");
@@ -184,19 +244,24 @@ async function getRootDisk(): Promise<{ totalGB: number; usedGB: number; freeGB:
   }
 }
 
+/* ---------------- users & connections (typed) --------------------- */
+
 function parseWho(lines: string[]): SystemDetails["activeUsers"] {
   const out: SystemDetails["activeUsers"] = [];
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
     const tokens = line.split(/\s+/);
-    const user = tokens[0] || "?";
-    const tty = tokens[1] || "?";
+    const user = tokens[0] ?? "?";
+    const tty = tokens[1] ?? "?";
     const hostMatch = line.match(/\(([^)]+)\)\s*$/);
     const host = hostMatch ? hostMatch[1] : null;
+
+    // everything after tty minus (host)
     let since = line.replace(/\s+\([^)]+\)\s*$/, "");
     const idx = since.indexOf(tty);
     since = idx >= 0 ? since.slice(idx + tty.length).trim() : since;
+
     out.push({ user, tty, host, since });
   }
   return out;
@@ -242,13 +307,18 @@ async function getSshConnections(): Promise<SystemDetails["sshConnections"]> {
   }
 }
 
+/* ------------------------------- main ----------------------------- */
+
 export async function getSystemDetails(): Promise<SystemDetails> {
   const cpuUsagePercentPerCore = getCpuUsage();
+
   const totalMem = os.totalmem();
   const freeMem = os.freemem();
   const usedMem = totalMem - freeMem;
-  const mi = await readMeminfo().catch(() => ({} as any));
+
+  const mi = await readMeminfo().catch(() => ({} as Record<string, number>));
   const avail = mi.MemAvailable ?? freeMem;
+
   const cpuTemp = await getCpuTemp();
   const rootDisk = await getRootDisk();
   const activeUsers = await getActiveUsers();

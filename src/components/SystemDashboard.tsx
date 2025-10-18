@@ -1,4 +1,4 @@
-// components/SystemDashboard.tsx
+// src/components/SystemDashboard.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -27,6 +27,15 @@ export default function SystemDashboard() {
   const [error, setError] = useState<string | null>(null);
   const timer = useRef<number | null>(null);
 
+  function errorToString(e: unknown): string {
+    if (e instanceof Error) return e.message;
+    try {
+      return JSON.stringify(e);
+    } catch {
+      return String(e);
+    }
+  }
+
   async function fetchData(signal?: AbortSignal) {
     try {
       setError(null);
@@ -34,8 +43,9 @@ export default function SystemDashboard() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = (await res.json()) as SystemDetails;
       setData(json);
-    } catch (e: any) {
-      if (e?.name !== "AbortError") setError(String(e?.message || e));
+    } catch (e: unknown) {
+      const name = (e as { name?: string }).name;
+      if (name !== "AbortError") setError(errorToString(e));
     }
   }
 
@@ -50,19 +60,14 @@ export default function SystemDashboard() {
   }, []);
 
   if (error) {
-    return (
-      <div className="text-sm text-red-500">
-        Failed to load system info: {error}
-      </div>
-    );
+    return <div className="text-sm text-red-500">Failed to load system info: {error}</div>;
   }
 
   if (!data) {
     return <div className="text-sm text-muted-foreground">Loading system info…</div>;
   }
 
-  const cpuTemp =
-    typeof data.cpuTempC === "number" ? `${data.cpuTempC.toFixed(1)}°C` : "N/A";
+  const cpuTemp = typeof data.cpuTempC === "number" ? `${data.cpuTempC.toFixed(1)}°C` : "N/A";
   const uptimeH = Math.floor(data.uptimeSec / 3600);
   const uptimeM = Math.floor((data.uptimeSec % 3600) / 60);
   const loadAvg = data.loadAvg.map((n) => n.toFixed(2)).join(" / ");
